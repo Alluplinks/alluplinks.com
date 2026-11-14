@@ -110,6 +110,49 @@ function HoursCard({ value, onSave }) {
   );
 }
 
+// Shown only while the server allows a restore (ALLOW_RESTORE=true and no bookings, trade-ins or inquiries yet),
+// i.e. on a new host during a move. Uploads the backup downloaded from the old site.
+function RestoreCard() {
+  const { data: st } = useAdminList('/restore');
+  const [file, setFile] = useState(null);
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState(null);
+  const [error, setError] = useState('');
+  if (done) return (
+    <div className="card p-6 ring-1 ring-emerald-200">
+      <h2 className="flex items-center gap-2 text-lg font-bold"><CheckCircle2 className="h-5 w-5 text-emerald-600" aria-hidden="true" />Backup restored and verified</h2>
+      <p className="mt-2 text-sm text-ink-500">Backup from {done.exported_at ? new Date(done.exported_at).toLocaleString('en-CA') : 'unknown date'} — every table’s row count matched the file:</p>
+      <ul className="mt-3 grid gap-x-6 gap-y-1 text-sm sm:grid-cols-3">{Object.entries(done.counts).map(([t, n]) => <li key={t} className="flex justify-between gap-3"><span className="text-ink-500">{t.replace(/_/g, ' ')}</span><strong>{n}</strong></li>)}</ul>
+      <p className="mt-4 text-sm font-semibold">You have been signed out. Sign in again with the admin email and password from the old website.</p>
+      <a href="/admin" className="btn-primary mt-4 inline-flex">Go to sign in</a>
+    </div>
+  );
+  if (!st?.allowed) return null;
+  const submit = async (e) => {
+    e.preventDefault(); setError('');
+    if (!file) return setError('Choose the backup .json file first.');
+    if (!window.confirm('Replace ALL data on this website with the backup file? This new site’s current data will be overwritten.')) return;
+    setBusy(true);
+    const fd = new FormData(); fd.append('password', password); fd.append('backup', file);
+    try { setDone(await adminApi('/restore', { method: 'POST', form: fd })); }
+    catch (err) { setError(err.message); }
+    finally { setBusy(false); }
+  };
+  return (
+    <form onSubmit={submit} className="card p-6 ring-1 ring-amber-200">
+      <h2 className="text-lg font-bold">Restore from backup (moving to a new host)</h2>
+      <p className="mt-1 text-sm text-ink-500">Upload the backup downloaded from the old website (Site settings → Download backup). All data on this site — prices, products, services, reviews, settings, bookings and admin accounts — is replaced with the backup. It is all-or-nothing: if anything fails, nothing changes. This option disappears once the site has customer records.</p>
+      <div className="mt-4 grid gap-4 sm:grid-cols-2">
+        <label className="block"><span className="label">Backup file (.json)</span><input type="file" accept="application/json,.json" className="input" onChange={(e) => setFile(e.target.files[0] || null)} /></label>
+        <label className="block"><span className="label">Your current admin password</span><input type="password" autoComplete="current-password" className="input" value={password} onChange={(e) => setPassword(e.target.value)} /></label>
+      </div>
+      {error && <p className="mt-4 flex items-start gap-2 rounded-xl bg-red-50 p-3 text-sm text-red-700 ring-1 ring-red-200" role="alert"><XCircle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />{error}</p>}
+      <div className="mt-5 flex justify-end"><button className="btn-primary" disabled={busy}>{busy ? 'Restoring…' : 'Restore backup'}</button></div>
+    </form>
+  );
+}
+
 export function SettingsAdmin() {
   const { data } = useAdminList('/settings');
   if (!data) return <Spinner />;
@@ -117,6 +160,7 @@ export function SettingsAdmin() {
   return (
     <div className="space-y-6">
       <PageTitle title="Site settings" actions={<a href="/api/admin/backup" className="btn-outline" download>Download backup</a>}>Store information, website content and SEO defaults. Changes appear on the website immediately. Download a backup of all data (bookings, prices, settings) at any time.</PageTitle>
+      <RestoreCard />
       <SettingsCard title="Store information" value={data.business} onSave={put('business')} description="Used in the header, footer, contact page, emails, Google Maps and structured data."
         fields={[{ name: 'name', label: 'Business name' }, { name: 'legal_name', label: 'Full store name' }, { name: 'street', label: 'Street address' }, { name: 'city', label: 'City' },
           { name: 'region', label: 'Province code' }, { name: 'region_name', label: 'Province' }, { name: 'postal_code', label: 'Postal code', hint: 'Optional — add once confirmed.' }, { name: 'country', label: 'Country code' },

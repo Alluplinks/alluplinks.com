@@ -1,9 +1,11 @@
 name: CI
-# Builds the site and runs the full end-to-end test suite on every push and pull request.
-# Render deploys `main` only after this check passes (autoDeployTrigger: checksPass in render.yaml).
+# Builds the site and runs the full end-to-end test suite on every push and pull request:
+#   • SQLite (local/Turso dialect), including a restore into MySQL — the Render/Turso → Hostinger migration path
+#   • MySQL 8 and MariaDB 11 (Hostinger databases)
+# Render deploys `main` only after these checks pass (autoDeployTrigger: checksPass in render.yaml).
 on:
   push:
-    branches: [main]
+    branches: [main, hostinger-mysql]
   pull_request:
     branches: [main]
 concurrency:
@@ -11,8 +13,27 @@ concurrency:
   cancel-in-progress: true
 jobs:
   test:
+    name: test (${{ matrix.db }})
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - db: sqlite
+            image: mysql:8.0
+          - db: mysql
+            image: mysql:8.0
+          - db: mariadb
+            image: mariadb:11.4
+    services:
+      database:
+        image: ${{ matrix.image }}
+        env:
+          MYSQL_ROOT_PASSWORD: ci-root-pw
+          MARIADB_ROOT_PASSWORD: ci-root-pw
+        ports:
+          - 3306:3306
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -23,4 +44,22 @@ jobs:
       - run: npm run build
       - name: Install Playwright (test-only, not a project dependency)
         run: npm install --no-save playwright@1.63.0 && npx playwright install --with-deps chromium
-      - run: npm test
+      - name: Create test databases
+        run: |
+          node --input-type=module -e "
+          const mysql = (await import('mysql2/promise')).default;
+          for (let i = 0; ; i++) {
+            try {
+              const c = await mysql.createConnection({ host: '127.0.0.1', user: 'root', password: 'ci-root-pw' });
+              for (const d of ['au_test', 'au_test2']) await c.query('CREATE DATABASE IF NOT EXISTS ' + d + ' CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci');
+              console.log('database server ready:', (await c.query('SELECT VERSION() v'))[0][0].v); await c.end(); break;
+            } catch (e) { if (i > 60) throw e; await new Promise((r) => setTimeout(r, 2000)); }
+          }"
+      - name: Run tests
+        env:
+          TEST_DB_HOST: 127.0.0.1
+          TEST_DB_USER: root
+          TEST_DB_PASSWORD: ci-root-pw
+          TEST_DB_NAME: ${{ matrix.db != 'sqlite' && 'au_test' || '' }}
+          TEST_DB_NAME2: au_test2
+        run: npm test

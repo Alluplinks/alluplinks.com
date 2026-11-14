@@ -10,7 +10,7 @@ import rateLimit from 'express-rate-limit';
 import multer from 'multer';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import { db, j, getSetting, setSetting, exclusive, DATA_DIR, DB_KIND, ready, exportAll } from './db.js';
+import { db, j, getSetting, setSetting, exclusive, DATA_DIR, DB_KIND, ready, exportAll, importAll, customerRecordCount } from './db.js';
 import { sendMail, notifyAdmin, emailLayout, EMAIL_KIND } from './email.js';
 import { saveFiles, removeFiles, sendPrivateFile, STORAGE_KIND, UPLOADS } from './storage.js';
 import { estimateTradeIn } from '../shared/tradein.js';
@@ -450,6 +450,35 @@ admin.get('/backup', wrap(async (_req, res) => {
   res.json(data);
 }));
 
+// Restore from a backup file — for moving the site to a new database (e.g. Render/Turso → Hostinger MySQL).
+// Safeguards: only when the server was started with ALLOW_RESTORE=true, only while the database has no
+// bookings, trade-ins or inquiries (so live customer data can never be overwritten), the admin password must
+// be re-entered, and the import is all-or-nothing with every table's row count verified before it is saved.
+async function restoreStatus() {
+  if (process.env.ALLOW_RESTORE !== 'true') return { allowed: false, reason: 'Restore is switched off. It is only enabled while moving the site to a new database.' };
+  const n = await customerRecordCount();
+  if (n) return { allowed: false, reason: `This database already has ${n} booking, trade-in or inquiry record(s), so a restore could overwrite customer data.` };
+  return { allowed: true, reason: '' };
+}
+const backupUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024, files: 1 } });
+admin.get('/restore', wrap(async (_req, res) => res.json(await restoreStatus())));
+admin.post('/restore', backupUpload.single('backup'), wrap(async (req, res) => {
+  const st = await restoreStatus();
+  if (!st.allowed) return res.status(403).json({ error: st.reason });
+  const u = await db.get('SELECT * FROM admin_users WHERE id = ?', req.admin.id);
+  if (!bcrypt.compareSync(String(req.body?.password || ''), u.password_hash)) return res.status(400).json({ error: 'Current password is incorrect.' });
+  let backup;
+  try { backup = JSON.parse(req.file?.buffer.toString('utf8') || ''); } catch { return res.status(422).json({ error: 'Choose the .json backup file downloaded from the current website.' }); }
+  if (backup?.format !== 'alluplinks-backup' || !backup.tables?.admin_users?.length) return res.status(422).json({ error: 'That file is not a complete All Uplinks backup.' });
+  let counts;
+  try { counts = await importAll(backup); }
+  catch (e) { console.error('[restore] failed, nothing changed:', String(e.message).split('\n')[0].slice(0, 200)); return res.status(422).json({ error: 'Restore failed and nothing was changed: ' + e.message }); }
+  console.log('[restore] Restored backup from', backup.exported_at, counts);
+  // Admin accounts now come from the backup, so this session ends; sign in with the old website's login.
+  res.clearCookie('au_admin', { ...cookieOpts, maxAge: undefined });
+  res.json({ ok: true, exported_at: backup.exported_at, counts });
+}));
+
 // Generic CRUD for content tables. Only whitelisted columns are writable.
 const TABLES = {
   categories: { cols: ['slug', 'name', 'device_type', 'image', 'blurb', 'sort', 'active'], order: 'sort, id' },
@@ -489,7 +518,7 @@ function rowIn(table, body) {
   return out;
 }
 const rowOut = (table, r) => { const t = TABLES[table]; const o = { ...r }; for (const c of t.json || []) o[c] = j(r[c], []); return o; };
-const conflict = (res, e) => res.status(409).json({ error: /UNIQUE/.test(e.message) ? 'An item with that name or slug already exists.' : e.message });
+const conflict = (res, e) => res.status(409).json({ error: /UNIQUE|Duplicate entry/i.test(e.message) ? 'An item with that name or slug already exists.' : e.message });
 
 admin.get('/t/:table', wrap(async (req, res) => {
   const t = TABLES[req.params.table]; if (!t) return res.status(404).json({ error: 'Unknown table' });
