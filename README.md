@@ -8,11 +8,11 @@ Website, booking system, trade-in tool, shop and admin dashboard for **All Uplin
 |---|---|
 | Frontend | React 18, Vite 5, React Router 6, Tailwind CSS 3, lucide icons |
 | Backend | Node.js 22 + Express 5 (single process serves API, SEO-rendered HTML and static files) |
-| Database | libSQL: **Turso** cloud database in production (`TURSO_DATABASE_URL`), a local SQLite file in `storage/` for development and tests — same SQL, same code |
+| Database | **MySQL / MariaDB** (Hostinger: `DB_HOST`…), **Turso** (`TURSO_DATABASE_URL`), or a local SQLite file in `storage/` for development and tests — same SQL and code; `server/driver.js` adapts it per database |
 | Auth | bcrypt-hashed admin passwords, JWT in an httpOnly SameSite=strict cookie, CSRF header check, login rate limiting |
 | Email | **Brevo** HTTP API (recommended, free), Resend API, or SMTP via Nodemailer — all attempts recorded in the admin Email log |
 | Uploads | Multer, images only, 8 MB max. **Cloudinary** in production (`CLOUDINARY_URL`), local disk in development. Customer photos are private (signed, admin-only) |
-| Hosting | **Render** free web service, auto-deployed from GitHub `main` after CI passes (`render.yaml`) |
+| Hosting | **Hostinger** Node.js web app with MySQL (see [HOSTINGER.md](HOSTINGER.md)), or **Render** auto-deployed from GitHub `main` after CI passes (`render.yaml`) |
 
 ## Quick start
 
@@ -37,17 +37,23 @@ See `.env.example`. On Render, set them in Dashboard → **alluplinks** → **En
 | Variable | Required | Purpose |
 |---|---|---|
 | `NODE_ENV` | yes (`production`) | Secure cookies, HTTPS-only content policy |
-| `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN` | yes | Cloud database. Without them a local file in `DATA_DIR` is used (data is lost on Render restarts) |
+| `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | one database | MySQL / MariaDB (Hostinger). `DATABASE_URL=mysql://…` also works |
+| `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN` | one database | Turso. With no database set, a local file in `DATA_DIR` is used (lost on Render restarts) |
 | `CLOUDINARY_URL` | yes | Photo storage. Without it, photos go to local disk (lost on Render restarts) |
 | `ADMIN_EMAIL`, `ADMIN_PASSWORD` | yes | Creates the admin account on first start against an empty database |
 | `JWT_SECRET` | yes | Signs admin sessions; Render generates it from `render.yaml` |
 | `BREVO_API_KEY`, `MAIL_FROM` | for email | Booking / trade-in confirmations. `MAIL_FROM` must be a sender verified in Brevo |
 | `ADMIN_NOTIFY_EMAIL` | recommended | Where new booking / trade-in / inquiry alerts are emailed |
 | `RESEND_API_KEY` or `SMTP_*` | optional | Alternative email providers (SMTP ports are blocked on Render's free tier) |
+| `ALLOW_RESTORE=true` | while moving hosts | Shows Admin → Site settings → **Restore from backup** (only while there are no bookings, trade-ins or inquiries) |
 | `ADMIN_RESET_PASSWORD=true` | one-time | Resets `ADMIN_EMAIL`'s password to `ADMIN_PASSWORD` on start (remove afterwards) |
 | `PORT`, `DATA_DIR`, `CLOUDINARY_FOLDER` | optional | Port (Render sets it), local data folder, Cloudinary folder name |
 
 Without email configured everything still works: submissions are saved and appear in the dashboard, and email attempts are logged as `not_sent`.
+
+## Deploying to Hostinger (MySQL)
+
+Step-by-step, including moving the data from Render/Turso: **[HOSTINGER.md](HOSTINGER.md)**.
 
 ## Deploying (Render + Turso + Cloudinary, all free tiers)
 
@@ -66,7 +72,10 @@ Without email configured everything still works: submissions are saved and appea
 
 ```bash
 TURSO_DATABASE_URL=libsql://... TURSO_AUTH_TOKEN=... node scripts/import-backup.mjs alluplinks-backup.json --yes
+DB_HOST=... DB_NAME=... DB_USER=... DB_PASSWORD=... node scripts/import-backup.mjs alluplinks-backup.json --yes
 ```
+
+or, on a new host started with `ALLOW_RESTORE=true`, Admin → Site settings → **Restore from backup**. Restores are all-or-nothing and check every table's row count before saving.
 
 Databases created by earlier versions of this site open unchanged; nothing is re-seeded or overwritten.
 
@@ -76,9 +85,13 @@ After going live, submit `https://alluplinks.com/sitemap.xml` in Google Search C
 
 ```bash
 npm run build && npm test
+# against MySQL/MariaDB (empty test databases; all their tables are dropped first):
+TEST_DB_HOST=127.0.0.1 TEST_DB_USER=… TEST_DB_PASSWORD=… TEST_DB_NAME=au_test TEST_DB_NAME2=au_test2 npm test
 ```
 
-`tests/e2e.mjs` starts the server on a throwaway database and checks, in a real browser: every route's status, title, description, canonical and structured data; sitemap/robots; all 579 prices against the source data; the calculator across device types; the full booking flow with photo upload; double-booking and concurrent-booking protection; validation; trade-in estimate and submission; contact, product inquiry and review moderation; admin auth/CSRF; admin price edits reaching the public site; every internal link; image loading and alt text; horizontal overflow at 390 px; console errors; compression and asset size; the health endpoint; backup download and a full restore round trip; cascade deletes.
+CI runs the suite three times: SQLite (with a restore into MySQL — the Turso → Hostinger path), MySQL 8 and MariaDB 11.
+
+`tests/e2e.mjs` starts the server on a throwaway database and checks, in a real browser: every route's status, title, description, canonical and structured data; sitemap/robots; all 579 prices against the source data; the calculator across device types; the full booking flow with photo upload; double-booking and concurrent-booking protection; validation; trade-in estimate and submission; contact, product inquiry and review moderation; admin auth/CSRF; admin price edits reaching the public site; every internal link; image loading and alt text; horizontal overflow at 390 px; console errors; compression and asset size; the health endpoint; backup download and a full restore round trip; restore through the admin into a fresh database (another engine when configured) with every record compared, rollback of a broken backup, and the restore safeguards; cascade deletes.
 
 ## What the owner should review before launch
 

@@ -25,7 +25,22 @@ const eq = (a, b, m) => assert(a === b, `${m || 'expected equal'}: got ${JSON.st
 const json = async (p, o = {}) => { const r = await fetch(BASE + p, o); return { status: r.status, body: await r.json().catch(() => null), headers: r.headers }; };
 const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64');
 
-const server = spawn(process.execPath, ['--no-warnings', 'server/index.js'], { cwd: ROOT, env: { ...process.env, PORT, DATA_DIR: DATA, NODE_ENV: 'production', ADMIN_EMAIL: 'owner@example.com', ADMIN_PASSWORD: 'test-password-123' }, stdio: ['ignore', 'pipe', 'pipe'] });
+// Database under test: local SQLite by default; MySQL/MariaDB when TEST_DB_HOST + TEST_DB_NAME are set (an empty
+// test database — all its tables are dropped first). TEST_DB_NAME2 (same server) is the target of the migration
+// test. Only the servers get the MySQL settings; helper scripts below use SQLite.
+const MYSQL_SERVER = process.env.TEST_DB_HOST ? { DB_HOST: process.env.TEST_DB_HOST, DB_PORT: process.env.TEST_DB_PORT || '3306', DB_USER: process.env.TEST_DB_USER, DB_PASSWORD: process.env.TEST_DB_PASSWORD } : null;
+const MYSQL = MYSQL_SERVER && process.env.TEST_DB_NAME ? { ...MYSQL_SERVER, DB_NAME: process.env.TEST_DB_NAME } : null;
+const MYSQL_TARGET = MYSQL_SERVER && process.env.TEST_DB_NAME2 ? { ...MYSQL_SERVER, DB_NAME: process.env.TEST_DB_NAME2 } : null;
+const DB_UNDER_TEST = MYSQL ? 'mysql' : 'local';
+async function mysqlReset(cfg) {
+  const mysql = (await import('mysql2/promise')).default;
+  const c = await mysql.createConnection({ host: cfg.DB_HOST, port: Number(cfg.DB_PORT), user: cfg.DB_USER, password: cfg.DB_PASSWORD, database: cfg.DB_NAME });
+  const [tables] = await c.query('SELECT TABLE_NAME t FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()');
+  for (const { t } of tables) await c.query(`DROP TABLE \`${t}\``);
+  await c.end();
+}
+if (MYSQL) { await mysqlReset(MYSQL); console.log(`Testing against MySQL database "${MYSQL.DB_NAME}"`); }
+const server = spawn(process.execPath, ['--no-warnings', 'server/index.js'], { cwd: ROOT, env: { ...process.env, ...MYSQL, PORT, DATA_DIR: DATA, NODE_ENV: 'production', ADMIN_EMAIL: 'owner@example.com', ADMIN_PASSWORD: 'test-password-123' }, stdio: ['ignore', 'pipe', 'pipe'] });
 server.stderr.on('data', (d) => process.stderr.write('[server] ' + d));
 for (let i = 0; i < 50; i++) { try { await fetch(BASE + '/api/site'); break; } catch { await new Promise((r) => setTimeout(r, 200)); } }
 
@@ -307,7 +322,7 @@ await test('Blocked date removes all slots', async () => {
 
 console.log('\nDeployment readiness');
 await test('Health endpoint reports database, storage and email status', async () => {
-  const h = (await json('/api/health')).body; eq(h.ok, true); eq(h.database, 'local'); eq(h.storage, 'local'); eq(h.email, 'none');
+  const h = (await json('/api/health')).body; eq(h.ok, true); eq(h.database, DB_UNDER_TEST); eq(h.storage, 'local'); eq(h.email, 'none');
 });
 await test('Backup download contains every table; restore round-trips all records', async () => {
   const r = await adminCtx.request.get(BASE + '/api/admin/backup'); eq(r.status(), 200);
@@ -323,6 +338,51 @@ await test('Backup download contains every table; restore round-trips all record
   const counts = JSON.parse(out.trim().split('\n').pop());
   for (const [t, rows] of Object.entries(backup.tables)) eq(counts[t], rows.length, 'restored ' + t);
   fs.rmSync(RESTORE, { recursive: true, force: true });
+});
+await test('Restore is refused unless enabled for a migration, and requires login', async () => {
+  eq((await adminFetch('/restore')).body.allowed, false, 'restore off by default');
+  const r = await adminCtx.request.post(BASE + '/api/admin/restore', { headers: { 'X-Requested-With': 'alluplinks-admin' }, multipart: { password: 'test-password-123', backup: { name: 'b.json', mimeType: 'application/json', buffer: Buffer.from('{}') } } });
+  eq(r.status(), 403, 'refused');
+  eq((await fetch(BASE + '/api/admin/restore')).status, 401, 'needs login');
+});
+await test(`Migration: backup from this ${MYSQL ? 'MySQL' : 'SQLite'} site restores through Admin into a fresh ${MYSQL_TARGET ? 'MySQL' : 'SQLite'} site with identical data`, async () => {
+  const canon = (backup) => Object.fromEntries(Object.entries(backup.tables).map(([t, rows]) => [t, rows.map((r) => JSON.stringify(Object.keys(r).sort().map((k) => [k, r[k]]))).sort()]));
+  const source = await (await adminCtx.request.get(BASE + '/api/admin/backup')).json();
+  const PORT2 = 4322, BASE2 = `http://localhost:${PORT2}`, DIR2 = fs.mkdtempSync(path.join(os.tmpdir(), 'au-migrate-'));
+  const target = MYSQL_TARGET;
+  if (target) await mysqlReset(target);
+  const env2 = { ...process.env, ...target, PORT: PORT2, DATA_DIR: DIR2, NODE_ENV: 'production', ADMIN_EMAIL: 'new-host@example.com', ADMIN_PASSWORD: 'new-host-pass-123', ALLOW_RESTORE: 'true' };
+  const s2 = spawn(process.execPath, ['--no-warnings', 'server/index.js'], { cwd: ROOT, env: env2, stdio: ['ignore', 'ignore', 'pipe'] });
+  s2.stderr.on('data', (d) => process.stderr.write('[server2] ' + d));
+  const c2 = await browser.newContext();
+  try {
+    for (let i = 0; i < 100; i++) { try { await fetch(BASE2 + '/api/health'); break; } catch { await new Promise((r) => setTimeout(r, 200)); } }
+    const H = { 'X-Requested-With': 'alluplinks-admin' };
+    eq((await c2.request.post(BASE2 + '/api/admin/login', { data: { email: 'new-host@example.com', password: 'new-host-pass-123' } })).status(), 200, 'login on new site');
+    eq((await (await c2.request.get(BASE2 + '/api/admin/restore')).json()).allowed, true, 'restore offered on empty site');
+    const up = (password, buffer) => c2.request.post(BASE2 + '/api/admin/restore', { headers: H, multipart: { password, backup: { name: 'backup.json', mimeType: 'application/json', buffer } } });
+    eq((await up('wrong-password', Buffer.from(JSON.stringify(source)))).status(), 400, 'password required');
+    // A broken backup (duplicate booking reference) is rejected and leaves the new site unchanged.
+    const broken = JSON.parse(JSON.stringify(source)); broken.tables.bookings.push({ ...broken.tables.bookings[0], id: 99999 });
+    const bad = await up('new-host-pass-123', Buffer.from(JSON.stringify(broken)));
+    eq(bad.status(), 422, 'broken backup rejected'); assert(/nothing was changed/.test((await bad.json()).error), 'rollback message');
+    eq((await (await c2.request.get(BASE2 + '/api/admin/backup')).json()).tables.bookings.length, 0, 'no partial import');
+    const ok = await up('new-host-pass-123', Buffer.from(JSON.stringify(source)));
+    const res = await ok.json(); eq(ok.status(), 200, 'restore ' + JSON.stringify(res));
+    for (const [t, rows] of Object.entries(source.tables)) eq(res.counts[t], rows.length, 'verified count ' + t);
+    // Old site's admin login now works on the new site; the temporary one is gone.
+    eq((await c2.request.post(BASE2 + '/api/admin/login', { data: { email: 'new-host@example.com', password: 'new-host-pass-123' } })).status(), 401, 'temporary admin replaced');
+    eq((await c2.request.post(BASE2 + '/api/admin/login', { data: { email: 'owner@example.com', password: 'test-password-123' } })).status(), 200, 'old login works');
+    const restored = await (await c2.request.get(BASE2 + '/api/admin/backup')).json();
+    const A = canon(source), B = canon(restored);
+    for (const t of Object.keys(A)) { eq(B[t].length, A[t].length, 'rows ' + t); A[t].forEach((row, i) => assert(row === B[t][i], `${t} differs:\n${row}\n${B[t][i]}`)); }
+    eq((await (await c2.request.get(BASE2 + '/api/admin/restore')).json()).allowed, false, 'no second restore once customer data exists');
+    // Public site on the new database shows the same prices and booking availability rules.
+    const cat1 = (await json('/api/catalog')).body; const cat2 = await (await fetch(BASE2 + '/api/catalog')).json();
+    eq(JSON.stringify(cat2), JSON.stringify(cat1), 'catalogue and prices identical');
+    const iphone15 = cat2.categories.find((c) => c.slug === 'iphone').brands[0].models.find((m) => m.name === 'iPhone 15');
+    eq(iphone15.prices.screen, 100); eq(iphone15.high.screen, 155);
+  } finally { await c2.close(); s2.kill(); fs.rmSync(DIR2, { recursive: true, force: true }); }
 });
 await test('Deleting a model removes its prices (explicit cascade)', async () => {
   const cat = (await adminFetch('/t/categories')).body.find((c) => c.slug === 'google-pixel');

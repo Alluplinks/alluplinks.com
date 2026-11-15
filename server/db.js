@@ -1,6 +1,6 @@
-// Database layer on libSQL: a Turso cloud database in production (TURSO_DATABASE_URL), or a local
-// SQLite file in development and tests. Same SQL and the same code path in both cases.
-import { createClient } from '@libsql/client';
+// Database layer. Runs on MySQL/MariaDB (Hostinger: DB_HOST…), Turso (TURSO_DATABASE_URL) or a local SQLite
+// file (development and tests) — see driver.js. Same SQL and the same code path in every case.
+import { openDriver, DB_KIND } from './driver.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -12,31 +12,26 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', 'storage');
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
-const remoteUrl = process.env.TURSO_DATABASE_URL;
-export const DB_KIND = remoteUrl ? 'turso' : 'local';
-export const client = createClient(remoteUrl
-  ? { url: remoteUrl, authToken: process.env.TURSO_AUTH_TOKEN }
-  : { url: 'file:' + (process.env.DB_PATH || path.join(DATA_DIR, 'alluplinks.db')) });
-
-const norm = (args) => args.map((a) => (a === undefined ? null : typeof a === 'boolean' ? (a ? 1 : 0) : a));
-const plain = (rs) => rs.rows.map((r) => ({ ...r }));
+export { DB_KIND };
+const driver = openDriver(DATA_DIR);
 
 // Small async query helpers used throughout the server.
 export const db = {
-  all: async (sql, ...args) => plain(await client.execute({ sql, args: norm(args) })),
-  get: async (sql, ...args) => plain(await client.execute({ sql, args: norm(args) }))[0],
-  run: async (sql, ...args) => {
-    const r = await client.execute({ sql, args: norm(args) });
-    return { lastInsertRowid: r.lastInsertRowid == null ? null : Number(r.lastInsertRowid), changes: r.rowsAffected };
-  },
-  // Runs all statements atomically (all succeed or none do) in one round trip. stmts: [[sql, ...args], ...]
-  batch: async (stmts) => { if (stmts.length) await client.batch(stmts.map(([sql, ...args]) => ({ sql, args: norm(args) })), 'write'); }
+  all: async (sql, ...args) => (await driver).all(sql, ...args),
+  get: async (sql, ...args) => (await driver).get(sql, ...args),
+  run: async (sql, ...args) => (await driver).run(sql, ...args), // → { lastInsertRowid, changes }
+  // Runs all statements atomically (all succeed or none do). stmts: [[sql, ...args], ...]
+  batch: async (stmts) => (await driver).batch(stmts),
+  // Runs fn({ all, get, run }) in one transaction; anything thrown rolls the whole thing back.
+  tx: async (fn) => (await driver).tx(fn)
 };
+export const closeDb = async () => (await driver).close();
 
-// Serialises critical sections (e.g. "check slot is free, then insert booking") within this server.
+// Serialises critical sections (e.g. "check slot is free, then insert booking"): within this process, and on
+// MySQL also across processes through a database lock.
 let chain = Promise.resolve();
 export function exclusive(fn) {
-  const run = chain.then(() => fn());
+  const run = chain.then(async () => (await driver).lock('alluplinks_booking', fn));
   chain = run.catch(() => {});
   return run;
 }
@@ -129,6 +124,60 @@ CREATE TABLE IF NOT EXISTS email_log (
   created_at TEXT DEFAULT (datetime('now')));
 `;
 
+// The same tables for MySQL 8.0.13+ / MariaDB 10.2+ (utf8mb4). Indexed text uses VARCHAR(191); timestamps are
+// stored in UTC and read back as 'YYYY-MM-DD HH:MM:SS' text, as in SQLite. As on Turso, child rows are removed
+// by the app (see CASCADE in index.js), so no foreign-key constraints are declared.
+const T = 'ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci';
+const NOW = 'DATETIME DEFAULT CURRENT_TIMESTAMP';
+const LIST = "DEFAULT ('[]')", OBJ = "DEFAULT ('{}')";
+const MYSQL_SCHEMA = [
+  `CREATE TABLE IF NOT EXISTS settings (\`key\` VARCHAR(191) NOT NULL PRIMARY KEY, value MEDIUMTEXT NOT NULL) ${T}`,
+  `CREATE TABLE IF NOT EXISTS admin_users (id INT AUTO_INCREMENT PRIMARY KEY, email VARCHAR(191) NOT NULL UNIQUE,
+    password_hash VARCHAR(255) NOT NULL, created_at ${NOW}) ${T}`,
+  `CREATE TABLE IF NOT EXISTS categories (id INT AUTO_INCREMENT PRIMARY KEY, slug VARCHAR(191) NOT NULL UNIQUE, name TEXT NOT NULL,
+    device_type VARCHAR(64) NOT NULL, image TEXT, blurb TEXT, sort INT DEFAULT 0, active INT DEFAULT 1) ${T}`,
+  `CREATE TABLE IF NOT EXISTS brands (id INT AUTO_INCREMENT PRIMARY KEY, category_id INT NOT NULL, name VARCHAR(191) NOT NULL,
+    sort INT DEFAULT 0, active INT DEFAULT 1, UNIQUE KEY brands_name (category_id, name)) ${T}`,
+  `CREATE TABLE IF NOT EXISTS models (id INT AUTO_INCREMENT PRIMARY KEY, brand_id INT NOT NULL, name VARCHAR(191) NOT NULL,
+    sort INT DEFAULT 0, active INT DEFAULT 1, UNIQUE KEY models_name (brand_id, name)) ${T}`,
+  `CREATE TABLE IF NOT EXISTS repair_types (id INT AUTO_INCREMENT PRIMARY KEY, device_type VARCHAR(64) NOT NULL, \`key\` VARCHAR(64) NOT NULL,
+    name TEXT NOT NULL, time_estimate TEXT, diagnose_only INT DEFAULT 0, sort INT DEFAULT 0, active INT DEFAULT 1,
+    UNIQUE KEY repair_types_key (device_type, \`key\`)) ${T}`,
+  `CREATE TABLE IF NOT EXISTS prices (model_id INT NOT NULL, repair_type_id INT NOT NULL, price INT NOT NULL, price_high INT,
+    PRIMARY KEY (model_id, repair_type_id), KEY prices_repair (repair_type_id)) ${T}`,
+  `CREATE TABLE IF NOT EXISTS services (id INT AUTO_INCREMENT PRIMARY KEY, slug VARCHAR(191) NOT NULL UNIQUE, name TEXT NOT NULL,
+    short TEXT, description MEDIUMTEXT, benefits MEDIUMTEXT ${LIST}, image TEXT, image_alt TEXT, price_source TEXT ${OBJ}, price_note TEXT,
+    time_estimate TEXT, warranty TEXT, faqs MEDIUMTEXT ${LIST}, meta_title TEXT, meta_description TEXT, featured INT DEFAULT 0,
+    sort INT DEFAULT 0, active INT DEFAULT 1) ${T}`,
+  `CREATE TABLE IF NOT EXISTS bookings (id INT AUTO_INCREMENT PRIMARY KEY, ref VARCHAR(64) NOT NULL UNIQUE, category TEXT, brand TEXT,
+    model TEXT, repairs TEXT ${LIST}, est_low INT, est_high INT, needs_diagnosis INT DEFAULT 0, date VARCHAR(10) NOT NULL,
+    time VARCHAR(5) NOT NULL, name TEXT NOT NULL, email TEXT NOT NULL, phone TEXT NOT NULL, details TEXT, photos TEXT ${LIST},
+    status VARCHAR(32) DEFAULT 'pending', admin_notes TEXT, created_at ${NOW}, KEY bookings_slot (date, time, status)) ${T}`,
+  `CREATE TABLE IF NOT EXISTS blocked_dates (id INT AUTO_INCREMENT PRIMARY KEY, date VARCHAR(10) NOT NULL UNIQUE, reason TEXT) ${T}`,
+  `CREATE TABLE IF NOT EXISTS tradein_devices (id INT AUTO_INCREMENT PRIMARY KEY, device_type VARCHAR(64) NOT NULL, brand VARCHAR(100) NOT NULL,
+    model VARCHAR(191) NOT NULL, base_value INT NOT NULL, storages TEXT ${LIST}, sort INT DEFAULT 0, active INT DEFAULT 1,
+    UNIQUE KEY tradein_model (device_type, brand, model)) ${T}`,
+  `CREATE TABLE IF NOT EXISTS tradeins (id INT AUTO_INCREMENT PRIMARY KEY, ref VARCHAR(64) NOT NULL UNIQUE, device_type TEXT, brand TEXT,
+    model TEXT, storage TEXT, answers TEXT ${OBJ}, est_low INT, est_high INT, est_credit INT, name TEXT NOT NULL, email TEXT NOT NULL,
+    phone TEXT NOT NULL, notes TEXT, photos TEXT ${LIST}, status VARCHAR(32) DEFAULT 'new', offer_amount INT, admin_notes TEXT,
+    created_at ${NOW}) ${T}`,
+  `CREATE TABLE IF NOT EXISTS products (id INT AUTO_INCREMENT PRIMARY KEY, slug VARCHAR(191) NOT NULL UNIQUE, name TEXT NOT NULL,
+    category VARCHAR(64) NOT NULL, brand TEXT, \`condition\` VARCHAR(32) DEFAULT 'new', price DOUBLE, compare_at DOUBLE, images TEXT ${LIST},
+    short TEXT, description MEDIUMTEXT, specs TEXT ${LIST}, featured INT DEFAULT 0, sort INT DEFAULT 0, active INT DEFAULT 1,
+    created_at ${NOW}) ${T}`,
+  `CREATE TABLE IF NOT EXISTS inquiries (id INT AUTO_INCREMENT PRIMARY KEY, ref VARCHAR(64) NOT NULL UNIQUE, topic TEXT, name TEXT NOT NULL,
+    email TEXT, phone TEXT, message TEXT NOT NULL, product TEXT, photos TEXT ${LIST}, status VARCHAR(32) DEFAULT 'new', admin_notes TEXT,
+    created_at ${NOW}) ${T}`,
+  `CREATE TABLE IF NOT EXISTS faqs (id INT AUTO_INCREMENT PRIMARY KEY, question TEXT NOT NULL, answer TEXT NOT NULL,
+    page VARCHAR(64) DEFAULT 'general', sort INT DEFAULT 0, active INT DEFAULT 1) ${T}`,
+  `CREATE TABLE IF NOT EXISTS reviews (id INT AUTO_INCREMENT PRIMARY KEY, name TEXT NOT NULL, rating INT NOT NULL CHECK (rating BETWEEN 1 AND 5),
+    text TEXT NOT NULL, device TEXT, source VARCHAR(32) DEFAULT 'website', approved INT DEFAULT 0, link TEXT, review_date TEXT,
+    sort INT DEFAULT 0, created_at ${NOW}) ${T}`,
+  `CREATE TABLE IF NOT EXISTS notifications (id INT AUTO_INCREMENT PRIMARY KEY, kind TEXT, title TEXT, body TEXT, link TEXT,
+    \`read\` INT DEFAULT 0, created_at ${NOW}) ${T}`,
+  `CREATE TABLE IF NOT EXISTS email_log (id INT AUTO_INCREMENT PRIMARY KEY, recipient TEXT, subject TEXT, status TEXT, error TEXT,
+    created_at ${NOW}) ${T}`
+];
 // First-run seed. All rows are inserted with explicit ids in batched, atomic round trips so a remote
 // database is seeded in seconds; a "seed_complete" marker is written last.
 async function seedIfEmpty() {
@@ -301,7 +350,7 @@ async function ensureAdmin() {
   if (n) return;
   let password = process.env.ADMIN_PASSWORD;
   if (!password) {
-    if (DB_KIND === 'turso') {
+    if (DB_KIND !== 'local') {
       console.error('[db] No admin account exists. Set ADMIN_EMAIL and ADMIN_PASSWORD and restart to create one.');
       return;
     }
@@ -319,31 +368,53 @@ export async function exportAll() {
   for (const t of TABLE_NAMES) out.tables[t] = await db.all(`SELECT * FROM ${t}`);
   return out;
 }
-// Replaces all data with a backup. Runs as atomic batches; tables are cleared children-first.
+// Customer records that a restore would replace. A restore is only offered while these tables are empty.
+const CUSTOMER_TABLES = ['bookings', 'tradeins', 'inquiries'];
+export async function customerRecordCount() {
+  let n = 0;
+  for (const t of CUSTOMER_TABLES) n += (await db.get(`SELECT COUNT(*) n FROM ${t}`)).n;
+  return n;
+}
+
+// Replaces all data with a backup in ONE transaction: tables are cleared children-first, every row is
+// inserted with its original id, and the row count of every table is checked before committing. Any
+// error or mismatch rolls everything back, leaving the database exactly as it was.
 export async function importAll(backup) {
-  if (backup?.format !== 'alluplinks-backup') throw new Error('Not an All Uplinks backup file');
-  const order = TABLE_NAMES;
-  const S = [...order].reverse().map((t) => [`DELETE FROM ${t}`]);
-  for (const t of order) for (const row of backup.tables[t] || []) {
-    const cols = Object.keys(row);
-    S.push([`INSERT INTO ${t}(${cols.join(',')}) VALUES(${cols.map(() => '?').join(',')})`, ...cols.map((c) => row[c])]);
-  }
-  await db.batch(S);
+  if (backup?.format !== 'alluplinks-backup' || typeof backup.tables !== 'object') throw new Error('Not an All Uplinks backup file');
+  const unknown = Object.keys(backup.tables).filter((t) => !TABLE_NAMES.includes(t));
+  if (unknown.length) throw new Error(`Backup contains unknown tables: ${unknown.join(', ')}`);
+  const counts = {};
+  await db.tx(async (t) => {
+    for (const name of [...TABLE_NAMES].reverse()) await t.run(`DELETE FROM ${name}`);
+    for (const name of TABLE_NAMES) {
+      const rows = backup.tables[name] || [];
+      const allowed = new Set(await (await driver).columns(name));
+      for (const row of rows) {
+        const cols = Object.keys(row);
+        const bad = cols.find((c) => !allowed.has(c));
+        if (bad) throw new Error(`Backup column ${name}.${bad} does not exist in this database`);
+        await t.run(`INSERT INTO ${name}(${cols.join(',')}) VALUES(${cols.map(() => '?').join(',')})`, ...cols.map((c) => row[c]));
+      }
+      const n = (await t.get(`SELECT COUNT(*) n FROM ${name}`)).n;
+      if (n !== rows.length) throw new Error(`Restore check failed for ${name}: backup has ${rows.length} rows, database has ${n}`);
+      counts[name] = n;
+    }
+  });
   await loadSettings();
+  return counts;
 }
 
 // Adds columns introduced after a database was created (SQLite ALTER TABLE only adds; nothing is removed).
 const ADDED_COLUMNS = { reviews: [['link', 'TEXT'], ['review_date', 'TEXT'], ['sort', 'INTEGER DEFAULT 0']], prices: [['price_high', 'INTEGER']] };
 async function addMissingColumns() {
   for (const [table, cols] of Object.entries(ADDED_COLUMNS)) {
-    const have = new Set((await db.all(`PRAGMA table_info(${table})`)).map((c) => c.name));
-    for (const [name, type] of cols) if (!have.has(name)) await client.execute(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`);
+    const have = new Set(await (await driver).columns(table));
+    for (const [name, type] of cols) if (!have.has(name)) await db.run(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`);
   }
 }
 
 export const ready = (async () => {
-  if (DB_KIND === 'local') await client.execute('PRAGMA journal_mode = WAL').catch(() => {});
-  await client.executeMultiple(SCHEMA);
+  await (await driver).exec(DB_KIND === 'mysql' ? MYSQL_SCHEMA : SCHEMA);
   await addMissingColumns();
   await loadSettings();
   const seeded = await seedIfEmpty();
